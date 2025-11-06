@@ -1,6 +1,7 @@
 import sys
 import socket
 import os
+import threading
 
 # --- Define Helper Functions ---
 
@@ -159,7 +160,10 @@ def main():
         while True:
             client_socket, client_addr = server_socket.accept()
             print(f"Connected: {client_addr}")
-            handle_client(client_socket)
+
+            t = threading.Thread(target=handle_client, args=(client_socket,))
+            t.daemon = True
+            t.start()
 
     except KeyboardInterrupt:
         print("\nShutting down server...")
