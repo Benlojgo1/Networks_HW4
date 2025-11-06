@@ -2,174 +2,213 @@ import sys
 import socket
 import os
 import threading
+import argparse
+from datetime import datetime
 
-# --- Define Helper Functions ---
+# Glogal connection tracking
+total_conn = 0
+total_conn_lock - threading.lock()
+per_client_conn = {}
+per_client_lock = threading.Lock()
 
-# Take raw request data and extracts the essential parts, specifically:
-#          1) The requested file path
-#          2) The HTTP method
-#          3) The 'User-Agent' header
-def parse_request(request_data):
-    lines = request_data.splitlines()
-    if not lines:
-        return None, None, None
+CONTENT_TYPES = {
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".txt": "text/plain",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".pdf": "application/pdf",
+}
 
-    # Parse the request line: e.g., "GET /index.html HTTP/1.0"
-    parts = lines[0].split()
-    if len(parts) < 2:
-        return None, None, None
+BUFFER_SIZE = 1024
+FILE_CHUNK = 4096
 
-    method = parts[0]
-    path = parts[1]
-
-    # Extract User-Agent header if available
-    user_agent = None
-    for line in lines:
-        if line.lower().startswith("user-agent:"):
-            user_agent = line.split(":", 1)[1].strip()
-            break
-
-    return method, path, user_agent
-
-# Based on the file extension (e.g., .html, .png, .pdf), determine the correct
-#          Content-Type string for the HTTP response header. (Q2 in README)
-def get_content_type(file_path):
-    extension_map = {
-        ".html": "text/html",
-        ".htm": "text/html",
-        ".txt": "text/plain",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".css": "text/css",
-        ".js": "application/javascript",
-        ".pdf": "application/pdf",
-    }
-
-    for ext, content_type in extension_map.items():
-        if file_path.endswith(ext):
-            return content_type
-    return "application/octet-stream"
-
-# Construct the complete HTTP response message, including headers and the body.
-#          Handles Success and Failure cases
-def build_response(status_code, content_type=None, body=None):
-    reasons = {
-        200: "OK",
-        403: "Forbidden",
-        404: "Not Found",
-    }
-
-    reason = reasons.get(status_code, "Unknown")
-    response = f"HTTP/1.0 {status_code} {reason}\r\n"
-
-    if content_type:
-        response += f"Content-Type: {content_type}\r\n"
-
-    response += "\r\n"  # End of headers
-
-    if body:
-        if isinstance(body, str):
-            body = body.encode()
-        return response.encode() + body
-    else:
-        return response.encode()
-
-
-# --- Client Connection Handler ---
-
-def handle_client(client_socket):
+# argument parsing
+def parse_args():
+    if len(sys.argv) != 7:
+        print("Usage: ./http_server_conc -p <port> -maxclient <num> -maxtotal <num>")
+        sys.exit(1)
     try:
-        # 1. Read Request: Read all incoming data from the 'client_socket'.
-        request_data = client_socket.recv(1024).decode()
-        if not request_data:
-            return
-        
-        # 2. Print Debug Info: Print the inbound request message.
-        print("----- Incoming Request -----")
-        print(request_data)
+        port_index = sys.argv.index("-p") + 1
+        maxclient_index = sys.argv.index("-maxclient") + 1
+        maxtotal_index = sys.argv.index("-maxtotal") + 1
+        port = int(sys.argv[port_index])
+        maxclient = int(sys.argv[maxclient_index])
+        maxtotal = int(sys.argv[maxtotal_index])
+    except (ValueError, IndexError):
+        print("Invalid arguments.")
+        sys.exit(1)
+    return port, maxclient, maxtotal
 
-        # 3. Parse Request: Call 'parse_request' to get the requested file path and User-Agent.
-        method, path, user_agent = parse_request(request_data)
+# content type detection
+def get_content_type(path):
+    _, ext = os.path.splitext(path)
+    return CONTENT_TYPES.get(ext.lower(), "application/octet-stream")
+
+# URl decoder
+def simple_unquote(s):
+    res = ""
+    i = 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s):
+            try:
+                hex_val = s[i+1:i+3]
+                res += chr(int(hex_val, 16))
+                i += 3
+            except ValueError:
+                res += s[i]
+                i += 1
+        else:
+            res += s[i]
+            i += 1
+    return res
+
+# combine IP and User-Agent to get client ID
+def make_client_id(addr, headers):
+    user_agent = headers.get("User-Agent", "")
+    return f"{addr[0]}::{user_agent}"
+
+# connection slot tracking
+def try_reserve_slot(client_id, maxclient, maxtotal):
+    global total_conn
+    with total_conn_lock:
+        if total_conn >= maxtotal:
+            return "total_limit"
+        total_conn += 1
+
+    with per_client_lock:
+        count = per_client_conn.get(client_id, 0)
+        if count >= maxclient:
+            with total_conn_lock:
+                total_conn -= 1
+            return "client_limit"
+        per_client_conn[client_id] = count + 1
+
+    return "ok"
+
+
+def release_slot(client_id):
+    global total_conn
+    with per_client_lock:
+        if client_id in per_client_conn:
+            per_client_conn[client_id] -= 1
+            if per_client_conn[client_id] <= 0:
+                del per_client_conn[client_id]
+
+    with total_conn_lock:
+        total_conn -= 1
+
+# manually read headers
+def read_headers(conn):
+    conn.settimeout(2)
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            part = conn.recv(BUFFER_SIZE)
+            if not part:
+                break
+            data += part
+    except socket.timeout:
+        pass
+    return data.decode("iso-8859-1", errors="replace")
+
+# parse request line and headers
+def parse_request_line_and_headers(request_text):
+    lines = request_text.split("\r\n")
+    if not lines or len(lines[0].split()) < 3:
+        return None, None, None, {}
+
+    method, path, version = lines[0].split()[:3]
+    headers = {}
+    for line in lines[1:]:
+        if ": " in line:
+            k, v = line.split(": ", 1)
+            headers[k] = v
+    return method, simple_unquote(path), version, headers
+
+# client handler
+def handle_client(conn, addr, maxclient, maxtotal):
+    request_text = read_headers(conn)
+    method, path, version, headers = parse_request_line_and_headers(request_text)
+
+    client_id = make_client_id(addr, headers)
+    result = try_reserve_slot(client_id, maxclient, maxtotal)
+
+    if result == "total_limit":
+        conn.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+        conn.close()
+        return
+    elif result == "client_limit":
+        conn.sendall(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
+        conn.close()
+        return
+
+    try:
         if not method or not path:
-            return
-        
-        # 4. Security Check: If the browser is not allowed, send a 403 response
-        if user_agent and "curl" in user_agent.lower():
-            body = "<html><body><h1>403 Forbidden</h1></body></html>"
-            response = build_response(403, "text/html", body)
-            client_socket.sendall(response)
-            return
-        
-        # 5. File Handling:
-        #    a. Check if the file exists on the server's file system
-        #    b. If the file doesn't exist, build and send a 404 Not Found response.
-        #    c. If the file exist, read its binary content.
-        if path == "/":
-            path = "/index.html"
-
-        file_path = "." + path  # Serve from current directory
-
-        #6. Builds and sends response
-        if not os.path.isfile(file_path):
-            body = "<html><body><h1>404 Not Found</h1></body></html>"
-            response = build_response(404, "text/html", body)
-            client_socket.sendall(response)
+            conn.close()
             return
 
-        # File exists
-        with open(file_path, "rb") as f:
-            content = f.read()
+        if method != "GET":
+            conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            return
 
-        content_type = get_content_type(file_path)
-        response = build_response(200, content_type, content)
-        client_socket.sendall(response)
+        safe_path = os.path.normpath(os.path.join(".", path.lstrip("/")))
+        if not safe_path.startswith("."):
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            return
+
+        if os.path.isdir(safe_path):
+            safe_path = os.path.join(safe_path, "index.html")
+
+        if not os.path.exists(safe_path):
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            return
+
+        content_type = get_content_type(safe_path)
+        file_size = os.path.getsize(safe_path)
+        header = (
+            "HTTP/1.1 200 OK\r\n"
+            f"Date: {datetime.utcnow():%a, %d %b %Y %H:%M:%S GMT}\r\n"
+            "Server: HTTPServerConcurrent/1.0\r\n"
+            f"Content-Length: {file_size}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        conn.sendall(header.encode())
+
+        with open(safe_path, "rb") as f:
+            while chunk := f.read(FILE_CHUNK):
+                conn.sendall(chunk)
 
     except Exception as e:
-        print(f"Error handling client: {e}")
-
+        print(f"[ERROR] {e}")
     finally:
-        # 7. Close Connection
-        client_socket.close()
+        release_slot(client_id)
+        conn.close()
 
-
-# --- Main Server Loop ---
-# Initialize the server and keeps it running indefinitely.
+# main method
 def main():
-    # 1. Argument Check: Verify the command was run correctly (e.g., `./http_server -p 20001`).
-    if len(sys.argv) < 7 or sys.argv[1] != "-p":
-        print(f"Usage: {sys.argv[0]} -p <port> -maxclient <numconn> -maxtotal <numconn>")
-        sys.exit(1)
+    port, maxclient, maxtotal = parse_args()
 
-    port = int(sys.argv[2])
-    max_client = int(sys.argv[4])
-    max_total = int(sys.argv[6])
-
-    # 2. Socket Creation: Create a TCP socket (`socket.socket(socket.AF_INET, socket.SOCK_STREAM)`).
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # 3. Bind and Listen: Bind the socket to the specified port and start listening for incoming connections.
     server_socket.bind(("", port))
-    server_socket.listen(5)
-    print(f"HTTP Server running on http://localhost:{port}/")
+    server_socket.listen(100)
 
-    # 4. Infinite Loop: Start a `while True:` loop to handle connections sequentially (per **Requirement 132**).
-    try:
-        while True:
-            client_socket, client_addr = server_socket.accept()
-            print(f"Connected: {client_addr}")
+    print(f"HTTP Server running on port {port}")
+    print(f"Max per-client: {maxclient}, Max total: {maxtotal}")
 
-            t = threading.Thread(target=handle_client, args=(client_socket,))
-            t.daemon = True
-            t.start()
+    while True:
+        conn, addr = server_socket.accept()
+        t = threading.Thread(
+            target=handle_client, args=(conn, addr, maxclient, maxtotal), daemon=True
+        )
+        t.start()
 
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
 
-    finally:
-        server_socket.close()
- ## <- Section 5
 if __name__ == "__main__":
     main()
