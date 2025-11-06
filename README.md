@@ -19,8 +19,8 @@ Where `<port>` is the server and the `<numconn>` are the maximum conccurent conn
    - python client_conc.py testcase2.txt 1 = 1 connections finished in 0.03 seconds
    - python client_conc.py testcase2.txt 10 = 10 connections finished in 0.09 seconds
 4. Report the times and speedup for the concurrent fetch of the URLs in testcase 1 and 2 with your http_server_conc. Are these the same numbers as above? Why or why not?
-     python client_conc.py testcase1.txt 1 = 1 connections finished in 10.25 seconds
-     python client_conc.py testcase1.txt 10 = 10 connections finished in 2.11 seconds
-     python client_conc.py testcase2.txt 1 = 1 connections finished in 10.27 seconds
-     python client_conc.py testcase2.txt 10 = 10 connections finished in 2.12 seconds
-   No, the numbers above are much smaller and it's much faster than our server because it has less concurrency overhead and no connection-limiting logic. Our server adds thread and lock management for enforcing limits, which increases    processing time per request.
+   - python client_conc.py testcase1.txt 1 = 1 connections finished in 10.25 seconds
+   - python client_conc.py testcase1.txt 10 = 10 connections finished in 2.11 seconds
+   - python client_conc.py testcase2.txt 1 = 1 connections finished in 10.27 seconds
+   - python client_conc.py testcase2.txt 10 = 10 connections finished in 2.12 seconds
+   - No, the numbers above are much smaller and it's much faster than our server because it has less concurrency overhead and no connection-limiting logic. Our server adds thread and lock management for enforcing limits, which increases    processing time per request.
