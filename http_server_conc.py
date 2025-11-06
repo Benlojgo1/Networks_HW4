@@ -7,7 +7,7 @@ from datetime import datetime
 
 # Glogal connection tracking
 total_conn = 0
-total_conn_lock - threading.lock()
+total_conn_lock = threading.Lock()
 per_client_conn = {}
 per_client_lock = threading.Lock()
 
