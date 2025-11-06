@@ -137,11 +137,13 @@ def handle_client(client_socket):
 # Initialize the server and keeps it running indefinitely.
 def main():
     # 1. Argument Check: Verify the command was run correctly (e.g., `./http_server -p 20001`).
-    if len(sys.argv) != 3 or sys.argv[1] != "-p":
-        print(f"Usage: {sys.argv[0]} -p <port>")
+    if len(sys.argv) < 7 or sys.argv[1] != "-p":
+        print(f"Usage: {sys.argv[0]} -p <port> -maxclient <numconn> -maxtotal <numconn>")
         sys.exit(1)
 
     port = int(sys.argv[2])
+    max_client = int(sys.argv[4])
+    max_total = int(sys.argv[6])
 
     # 2. Socket Creation: Create a TCP socket (`socket.socket(socket.AF_INET, socket.SOCK_STREAM)`).
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -164,6 +166,6 @@ def main():
 
     finally:
         server_socket.close()
-                                                                             <- Section 5
+ ## <- Section 5
 if __name__ == "__main__":
     main()
